@@ -16,6 +16,11 @@
     "type": "string",
     "default": "早餐,午餐,晚餐,夜宵,外卖,零食,饮品,水果,聚餐,食材采购,其他"
   },
+  "auto_image_ledger": {
+    "description": "自动识别图片账单：收到带图片的消息时自动尝试记账（无需输入指令）。关闭后需要手动发 /记账 记",
+    "type": "bool",
+    "default": true
+  },
   "max_items": {
     "description": "单次账单最多记录条数（防止模型异常输出过多条目）",
     "type": "int",

@@ -147,7 +147,7 @@ class FoodLedgerPlugin(Star):
                 sql += " AND category=?"
                 params.append(category)
             # TODO: 目前只取最近 200 条，账目多了之后考虑加分页
-            sql += " ORDER BY record_date DESC, id DESC LIMIT 200"
+            sql += " ORDER BY record_date DESC, created_at DESC LIMIT 200"
             return conn.execute(sql, params).fetchall()
         finally:
             conn.close()
@@ -357,13 +357,18 @@ class FoodLedgerPlugin(Star):
     # ============================================================
     # 输出格式化
     # ============================================================
+    @staticmethod
+    def _fmt_dt(ts: int) -> str:
+        """unix 时间戳 → MM-DD HH:MM（本地时区），查账/草稿展示用。"""
+        return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+
     def _format_draft(self, draft: dict, warnings: list[str] | None = None) -> str:
         items = draft["items"]
         total = sum(it["amount"] for it in items)
         currency = str(self.config.get("currency_symbol") or "元")
-        lines = [f"📋 待确认账单（共 {len(items)} 笔）"]
+        lines = [f"📋 待确认账单（共 {len(items)} 笔）｜{self._fmt_dt(draft.get('created_at') or int(time.time()))}"]
         if draft.get("record_date"):
-            lines[0] += f"｜日期：{draft['record_date']}"
+            lines[0] += f"｜账单日期：{draft['record_date']}"
         for i, it in enumerate(items, 1):
             lines.append(f"{i}. {it['category']}｜{it['amount']:.2f} {currency}｜{it['description'] or '—'}")
         lines.append("——————————————")
@@ -400,7 +405,7 @@ class FoodLedgerPlugin(Star):
         lines.append("\n📋 明细：")
         for idx, r in enumerate(reversed(rows), 1):  # 倒序查询，反转回时间正序
             lines.append(
-                f"#{idx} {r['record_date'][5:]} {r['category']} {r['amount']:.2f} {r['description'] or '—'}"
+                f"#{idx} {self._fmt_dt(r['created_at'])} {r['category']} {r['amount']:.2f} {r['description'] or '—'}"
             )
         lines.append("\n提示：可查询昨天/本月/上月，如「/记账 查账 本月」")
         return "\n".join(lines)
@@ -412,6 +417,72 @@ class FoodLedgerPlugin(Star):
     def ledger(self) -> None:
         """餐饮记账插件：AI 识别账单并分类记账。"""
         pass
+
+    # ---------- 自动识别：收到带图片的消息就直接尝试记账，不用输指令 ----------
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_any_message(self, event: AstrMessageEvent):
+        """带图片的消息自动尝试记账。
+
+        - 识别出账单 → 输出草稿并 stop_event，避免 AstrBot 再当普通聊天回复
+        - 识别失败 → 不打扰，让 AstrBot 正常处理这条消息
+        - 可通过插件配置「自动识别图片账单」关闭
+        """
+        if not self.config.get("auto_image_ledger", True):
+            return
+        image_urls = self._get_image_urls(event)
+        if not image_urls:
+            return
+        text = event.message_str.strip()
+        # 指令消息交给指令 handler 处理，这里跳过
+        if re.match(r"^[/／]?\s*(记账|ledger|账本)", text, re.I):
+            return
+        await self._ensure_drafts()
+        draft, warnings, err = await self._recognize(event, text, image_urls)
+        if err:
+            # 图里没有账单之类的，静默放行，让 AstrBot 正常聊天
+            logger.info(f"图片自动记账未识别到账单（已静默放行）: {err}")
+            return
+        for w in warnings:
+            yield event.plain_result("⚠️ " + w)
+        yield event.plain_result(self._format_draft(draft))
+        event.stop_event()
+
+    async def _recognize(
+        self, event: AstrMessageEvent, text: str, image_urls: list[str]
+    ) -> tuple[Optional[dict], list[str], Optional[str]]:
+        """识别账单并生成待确认草稿（指令和自动识别共用）。
+
+        返回 (draft, warnings, error)：draft 非 None 时已存入 self._drafts 并持久化。
+        """
+        umo = event.unified_msg_origin
+        provider_id = await self._resolve_text_provider(umo)
+        if not provider_id:
+            return None, [], "未找到可用的解析模型。请在 AstrBot WebUI 插件配置中设置「账单解析模型」。"
+        vision_provider_id = self._get_vision_provider()
+        warnings: list[str] = []
+        if image_urls and not vision_provider_id:
+            warnings.append("尚未配置「图片转述模型」，正在用解析模型直接识别图片，效果可能一般")
+        data = await self._parse_bill(provider_id, vision_provider_id, text, image_urls)
+        if data.get("error"):
+            return None, [], f"识别失败：{data['error']}"
+        items, validate_warnings = self._validate_items(data)
+        warnings.extend(validate_warnings)
+        if not items:
+            msg = "未能从账单中识别出有效条目，请确认图片清晰或文字描述完整"
+            if validate_warnings:
+                msg += "（" + "；".join(validate_warnings) + "）"
+            return None, [], msg
+        draft = {
+            "provider_id": provider_id,
+            "vision_provider_id": vision_provider_id or "",
+            "created_at": int(time.time()),
+            "items": items,
+            "record_date": data.get("record_date") or None,
+            "raw": text[:100] if text else "图片账单",
+        }
+        self._drafts[umo] = draft
+        await self._save_drafts()
+        return draft, warnings, None
 
     # ---------- 记：识别账单 ----------
     @ledger.command("记", alias={"record", "add", "记一笔"})
@@ -426,44 +497,14 @@ class FoodLedgerPlugin(Star):
                 "📝 请发送账单内容，例如：\n"
                 "· /记账 记 早餐包子豆浆 8.5 元\n"
                 "· /记账 记 帮我记一下昨晚聚餐 AA 每人 66\n"
-                "· 直接发送账单截图（图片消息）"
+                "· 直接发送账单截图（图片消息，会自动识别）"
             )
             return
-        umo = event.unified_msg_origin
-        provider_id = await self._resolve_text_provider(umo)
-        if not provider_id:
-            yield event.plain_result(
-                "❌ 未找到可用的解析模型。请在 AstrBot WebUI 插件配置中设置「账单解析模型」。"
-            )
-            return
-        vision_provider_id = self._get_vision_provider()
-        if image_urls and not vision_provider_id:
-            yield event.plain_result(
-                "⚠️ 尚未配置「图片转述模型」，将尝试用解析模型直接识别图片。\n"
-                "若识别效果不佳，请在插件配置中选择图片转述模型。"
-            )
         yield event.plain_result("🧾 正在识别账单，请稍候…")
-        data = await self._parse_bill(provider_id, vision_provider_id, text, image_urls)
-        if data.get("error"):
-            yield event.plain_result(f"❌ 识别失败：{data['error']}")
+        draft, warnings, err = await self._recognize(event, text, image_urls)
+        if err:
+            yield event.plain_result("❌ " + err)
             return
-        items, warnings = self._validate_items(data)
-        if not items:
-            msg = "❌ 未能从账单中识别出有效条目。请确认图片清晰或文字描述完整。"
-            if warnings:
-                msg += "\n" + "\n".join("⚠️ " + w for w in warnings)
-            yield event.plain_result(msg)
-            return
-        draft = {
-            "provider_id": provider_id,
-            "vision_provider_id": vision_provider_id or "",
-            "created_at": int(time.time()),
-            "items": items,
-            "record_date": data.get("record_date") or None,
-            "raw": text[:100] if text else "图片账单",
-        }
-        self._drafts[umo] = draft
-        await self._save_drafts()
         yield event.plain_result(self._format_draft(draft, warnings))
 
     # ---------- 确认：入账 ----------
@@ -505,8 +546,8 @@ class FoodLedgerPlugin(Star):
         total = sum(it["amount"] for it in items)
         currency = str(self.config.get("currency_symbol") or "元")
         yield event.plain_result(
-            f"✅ 已入账 {n} 笔，共 {total:.2f} {currency}（{rd}）\n"
-            f"「/记账 查账」查看统计，或继续「/记账 记 …」记录下一笔。"
+            f"✅ 已入账 {n} 笔，共 {total:.2f} {currency}（{rd}，{self._fmt_dt(now)} 记）\n"
+            f"「/记账 查账」查看统计，或直接发图片继续记账。"
         )
 
     # ---------- 修改：调整草稿 ----------
@@ -672,9 +713,9 @@ class FoodLedgerPlugin(Star):
             "📒 餐饮记账插件使用说明\n"
             "——————————————\n"
             "🧾 记账（AI 识别）：\n"
+            "· 直接发账单截图/支付截图，自动识别记账\n"
             "· /记账 记 早餐包子豆浆 8.5 元\n"
             "· /记账 记 昨晚聚餐 AA 每人 66\n"
-            "· 直接发送账单截图/支付截图（图片消息）\n"
             "图片账单：先由「图片转述模型」转成文字，\n"
             "再由「解析模型」整理成账目，结果先审查后入库。\n"
             "——————————————\n"

@@ -62,7 +62,13 @@ class _CmdGroup:
     def group(self, name, **kw):
         return _passthrough()
 
+class _EventMessageType:
+    ALL = "all"
+    PRIVATE_MESSAGE = "private"
+    GROUP_MESSAGE = "group"
+
 filter_mod = types.ModuleType("astrbot.api.event.filter")
+filter_mod.EventMessageType = _EventMessageType
 filter_mod.command = _passthrough
 def _cmd_group(name, alias=None, **kw):
     def deco(fn):
@@ -82,12 +88,15 @@ class AstrMessageEvent:
         self.message_obj = types.SimpleNamespace(message=message or [])
         self.unified_msg_origin = umo
         self._sender_id = sender_id
+        self._stopped = False
     def get_sender_id(self):
         return self._sender_id
     def get_sender_name(self):
         return "tester"
     def plain_result(self, text):
         return text
+    def stop_event(self):
+        self._stopped = True
 
 astrbot_event.AstrMessageEvent = AstrMessageEvent
 
@@ -348,6 +357,109 @@ class TestTwoStage(unittest.TestCase):
             self.assertIn("图片转述失败", data["error"])
             self.assertEqual(len(calls), 1)
 
+        asyncio.run(run())
+
+
+class TestAutoLedger(unittest.TestCase):
+    """图片自动记账（无需指令）+ 记录时间展示"""
+
+    def setUp(self):
+        plugin_mod.FoodLedgerPlugin._shared_kv.clear()
+
+    def _plugin(self, cfg=None, llm_ok=True):
+        ctx = Context()
+        ctx.providers = [FakeProvider("text-y", "gpt-4o")]
+
+        async def llm(**kw):
+            if not llm_ok:
+                raise RuntimeError("provider down")
+            return types.SimpleNamespace(completion_text=json.dumps({
+                "items": [{"amount": 15, "category": "午餐", "description": "牛肉面"}]
+            }))
+
+        ctx.llm_generate = llm
+        return plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig(cfg or {}))
+
+    def test_image_auto_ledger(self):
+        """纯图片消息 → 自动识别出草稿 + stop_event"""
+
+        async def run():
+            p = self._plugin()
+            ev = AstrMessageEvent(message_str="", message=[Image(url="https://img/bill.jpg")], umo="t:g:auto1")
+            out = [r async for r in p.on_any_message(ev)]
+            self.assertTrue(any("待确认账单" in str(r) for r in out))
+            self.assertTrue(ev._stopped)          # 阻止 AstrBot 再当普通聊天回复
+            self.assertIn("t:g:auto1", p._drafts)  # 草稿已建
+        asyncio.run(run())
+
+    def test_plain_text_ignored(self):
+        """纯文字消息不触发"""
+
+        async def run():
+            p = self._plugin()
+            ev = AstrMessageEvent(message_str="今天天气不错", umo="t:g:auto2")
+            out = [r async for r in p.on_any_message(ev)]
+            self.assertEqual(out, [])
+            self.assertFalse(ev._stopped)
+        asyncio.run(run())
+
+    def test_command_message_skipped(self):
+        """带记账指令前缀的消息跳过（交给指令 handler）"""
+
+        async def run():
+            p = self._plugin()
+            ev = AstrMessageEvent(
+                message_str="/记账 记 午餐 15",
+                message=[Image(url="https://img/b.jpg")],
+                umo="t:g:auto3",
+            )
+            out = [r async for r in p.on_any_message(ev)]
+            self.assertEqual(out, [])
+        asyncio.run(run())
+
+    def test_disabled_by_config(self):
+        """配置关闭后不触发"""
+
+        async def run():
+            p = self._plugin(cfg={"auto_image_ledger": False})
+            ev = AstrMessageEvent(message_str="", message=[Image(url="https://img/b.jpg")], umo="t:g:auto4")
+            out = [r async for r in p.on_any_message(ev)]
+            self.assertEqual(out, [])
+        asyncio.run(run())
+
+    def test_failure_silent(self):
+        """识别失败静默放行，不打扰用户，不 stop"""
+
+        async def run():
+            p = self._plugin(llm_ok=False)
+            ev = AstrMessageEvent(message_str="", message=[Image(url="https://img/photo.jpg")], umo="t:g:auto5")
+            out = [r async for r in p.on_any_message(ev)]
+            self.assertEqual(out, [])
+            self.assertFalse(ev._stopped)
+        asyncio.run(run())
+
+    def test_query_result_has_time(self):
+        """查账明细包含 MM-DD HH:MM 记账时间"""
+
+        async def run():
+            p = self._plugin()
+            ts = 1750000000
+            p._insert_records([("u1", "s1", "早餐", 8.5, "包子", "2026-08-12", ts, "raw", "t", "")])
+            rows = p._query_records("u1", "2026-08-01", "2026-08-31")
+            fmt = p._format_query_result("2026-08-12", "2026-08-12", rows, None)
+            self.assertRegex(fmt, r"#1 \d{2}-\d{2} \d{2}:\d{2} 早餐 8.50")
+            self.assertIn("总支出：8.50", fmt)
+        asyncio.run(run())
+
+    def test_draft_shows_time(self):
+        """草稿标题显示记账时刻"""
+
+        async def run():
+            p = self._plugin()
+            ev = AstrMessageEvent(message_str="", message=[Image(url="https://img/bill2.jpg")], umo="t:g:auto6")
+            out = [r async for r in p.on_any_message(ev)]
+            joined = "\n".join(str(r) for r in out)
+            self.assertRegex(joined, r"待确认账单（共 1 笔）｜\d{2}-\d{2} \d{2}:\d{2}")
         asyncio.run(run())
 
 
