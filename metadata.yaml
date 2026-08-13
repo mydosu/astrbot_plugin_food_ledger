@@ -1,0 +1,29 @@
+name: astrbot_plugin_food_ledger
+desc: 餐饮记账插件。支持发送图片或文字账单，由大模型自动识别并分类（早餐/午餐/晚餐/夜宵/外卖等），经用户确认后持久化入库，可随时查账统计。支持 AstrBot 全部消息平台，可在 WebUI 或聊天中自主选择已配置的模型提供商。
+author: mydosu
+version: v1.0.0
+repo: https://github.com/mydosu/astrbot_plugin_food_ledger
+astrbot_version: ">=4.16,<5"
+short_desc: AI 餐饮记账：图片/文字账单识别、分类、查账
+display_name: 餐饮记账
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
+  - telegram
+  - wecom
+  - wecom_ai_bot
+  - lark
+  - dingtalk
+  - discord
+  - slack
+  - kook
+  - vocechat
+  - weixin_official_account
+  - weixin_oc
+  - satori
+  - misskey
+  - line
+  - matrix
+  - mattermost
+  - webchat

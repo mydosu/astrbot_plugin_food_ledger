@@ -1,0 +1,29 @@
+{
+  "image_provider": {
+    "description": "图片转述模型：负责把账单图片/截图转成文字描述。请选择支持图片输入（视觉/多模态）的模型；留空则尝试用解析模型直接识别图片",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "llm_provider": {
+    "description": "账单解析模型：负责把文字账单整理成结构化账目（金额/类别/描述）。留空则使用当前会话正在使用的模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "categories": {
+    "description": "餐饮类别列表，逗号分隔（识别结果会自动归入这些类别，未匹配的归入「其他」）",
+    "type": "string",
+    "default": "早餐,午餐,晚餐,夜宵,外卖,零食,饮品,水果,聚餐,食材采购,其他"
+  },
+  "max_items": {
+    "description": "单次账单最多记录条数（防止模型异常输出过多条目）",
+    "type": "int",
+    "default": 20
+  },
+  "currency_symbol": {
+    "description": "金额单位符号，用于查账统计展示",
+    "type": "string",
+    "default": "元"
+  }
+}

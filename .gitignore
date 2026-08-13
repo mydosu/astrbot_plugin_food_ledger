@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 本地运行时数据（SQLite 账目库等）
+*.db
+*.db-wal
+*.db-shm
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
