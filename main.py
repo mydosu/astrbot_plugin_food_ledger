@@ -424,23 +424,32 @@ class FoodLedgerPlugin(Star):
         """带图片的消息自动尝试记账。
 
         - 识别出账单 → 输出草稿并 stop_event，避免 AstrBot 再当普通聊天回复
-        - 识别失败 → 不打扰，让 AstrBot 正常处理这条消息
+        - 识别失败：
+          - 配置/模型问题（未配置模型、调用失败）→ 明确提示用户，方便排查
+          - 图里没有账单内容 → 静默放行，让 AstrBot 正常处理
         - 可通过插件配置「自动识别图片账单」关闭
         """
         if not self.config.get("auto_image_ledger", True):
             return
         image_urls = self._get_image_urls(event)
         if not image_urls:
+            logger.debug("[记账] 消息无图片，跳过自动识别")
             return
         text = event.message_str.strip()
+        # 微信等平台纯图片消息的文本占位符，不是用户输入
+        if text in ("[未知消息]", "[图片]", "[Image]"):
+            text = ""
         # 指令消息交给指令 handler 处理，这里跳过
         if re.match(r"^[/／]?\s*(记账|ledger|账本)", text, re.I):
             return
         await self._ensure_drafts()
-        draft, warnings, err = await self._recognize(event, text, image_urls)
+        logger.info(f"[记账] 收到图片消息，共 {len(image_urls)} 张，尝试自动识别")
+        draft, warnings, err, err_kind = await self._recognize(event, text, image_urls)
         if err:
-            # 图里没有账单之类的，静默放行，让 AstrBot 正常聊天
-            logger.info(f"图片自动记账未识别到账单（已静默放行）: {err}")
+            if err_kind == "config":
+                # 配置或模型问题：提示用户，但仍放行给 AstrBot 正常处理
+                yield event.plain_result(f"⚠️ 图片自动记账没成功：{err}")
+            logger.warning(f"[记账] 自动识别未成功（{err_kind}）: {err}")
             return
         for w in warnings:
             yield event.plain_result("⚠️ " + w)
@@ -449,29 +458,33 @@ class FoodLedgerPlugin(Star):
 
     async def _recognize(
         self, event: AstrMessageEvent, text: str, image_urls: list[str]
-    ) -> tuple[Optional[dict], list[str], Optional[str]]:
+    ) -> tuple[Optional[dict], list[str], Optional[str], Optional[str]]:
         """识别账单并生成待确认草稿（指令和自动识别共用）。
 
-        返回 (draft, warnings, error)：draft 非 None 时已存入 self._drafts 并持久化。
+        返回 (draft, warnings, error_msg, error_kind)：
+        - error_kind = "config"：模型配置或调用问题，需要用户处理
+        - error_kind = "content"：没识别出账单内容（图里没有账单，属正常情况）
+        - error_msg 为 None 时 error_kind 也为 None，draft 已存入 self._drafts 并持久化。
         """
         umo = event.unified_msg_origin
         provider_id = await self._resolve_text_provider(umo)
         if not provider_id:
-            return None, [], "未找到可用的解析模型。请在 AstrBot WebUI 插件配置中设置「账单解析模型」。"
+            return None, [], "未找到可用的解析模型。请在 AstrBot WebUI 插件配置中设置「账单解析模型」。", "config"
         vision_provider_id = self._get_vision_provider()
         warnings: list[str] = []
         if image_urls and not vision_provider_id:
             warnings.append("尚未配置「图片转述模型」，正在用解析模型直接识别图片，效果可能一般")
+        logger.info(f"[记账] 图片转述模型: {vision_provider_id or '未配置（回退给解析模型）'}，解析模型: {provider_id}")
         data = await self._parse_bill(provider_id, vision_provider_id, text, image_urls)
         if data.get("error"):
-            return None, [], f"识别失败：{data['error']}"
+            return None, [], f"识别失败：{data['error']}", "config"
         items, validate_warnings = self._validate_items(data)
         warnings.extend(validate_warnings)
         if not items:
             msg = "未能从账单中识别出有效条目，请确认图片清晰或文字描述完整"
             if validate_warnings:
                 msg += "（" + "；".join(validate_warnings) + "）"
-            return None, [], msg
+            return None, [], msg, "content"
         draft = {
             "provider_id": provider_id,
             "vision_provider_id": vision_provider_id or "",
@@ -482,7 +495,7 @@ class FoodLedgerPlugin(Star):
         }
         self._drafts[umo] = draft
         await self._save_drafts()
-        return draft, warnings, None
+        return draft, warnings, None, None
 
     # ---------- 记：识别账单 ----------
     @ledger.command("记", alias={"record", "add", "记一笔"})
@@ -501,7 +514,7 @@ class FoodLedgerPlugin(Star):
             )
             return
         yield event.plain_result("🧾 正在识别账单，请稍候…")
-        draft, warnings, err = await self._recognize(event, text, image_urls)
+        draft, warnings, err, _ = await self._recognize(event, text, image_urls)
         if err:
             yield event.plain_result("❌ " + err)
             return

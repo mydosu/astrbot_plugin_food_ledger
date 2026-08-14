@@ -119,7 +119,7 @@ class FakeProvider:
 
 astrbot_path.get_astrbot_data_path = lambda: str(TMP_DATA)
 astrbot_api.AstrBotConfig = AstrBotConfig
-astrbot_api.logger = types.SimpleNamespace(info=print, warning=print, error=print)
+astrbot_api.logger = types.SimpleNamespace(info=print, warning=print, error=print, debug=print)
 astrbot_mc.Image = Image
 astrbot_star.Context = Context
 astrbot_star.Star = Star
@@ -427,12 +427,30 @@ class TestAutoLedger(unittest.TestCase):
             self.assertEqual(out, [])
         asyncio.run(run())
 
-    def test_failure_silent(self):
-        """识别失败静默放行，不打扰用户，不 stop"""
+    def test_config_failure_notifies(self):
+        """模型调用失败（配置类问题）→ 提示用户，但不 stop，让 AstrBot 正常处理"""
 
         async def run():
             p = self._plugin(llm_ok=False)
             ev = AstrMessageEvent(message_str="", message=[Image(url="https://img/photo.jpg")], umo="t:g:auto5")
+            out = [r async for r in p.on_any_message(ev)]
+            self.assertTrue(any("图片自动记账没成功" in str(r) for r in out))
+            self.assertFalse(ev._stopped)
+        asyncio.run(run())
+
+    def test_content_failure_silent(self):
+        """图里没有账单（内容类失败）→ 静默放行，不打扰用户，不 stop"""
+
+        async def run():
+            ctx = Context()
+            ctx.providers = [FakeProvider("text-y", "gpt-4o")]
+
+            async def llm(**kw):
+                return types.SimpleNamespace(completion_text=json.dumps({"items": []}))
+
+            ctx.llm_generate = llm
+            p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({}))
+            ev = AstrMessageEvent(message_str="", message=[Image(url="https://img/cat.jpg")], umo="t:g:auto7")
             out = [r async for r in p.on_any_message(ev)]
             self.assertEqual(out, [])
             self.assertFalse(ev._stopped)
