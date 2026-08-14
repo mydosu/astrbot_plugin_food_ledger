@@ -34,6 +34,15 @@ class Image:
         self.file = file
         self.url = url
 
+    async def convert_to_file_path(self):
+        """测试用：落一张真实小图到临时目录。"""
+        from PIL import Image as PILImage
+        import tempfile
+
+        p = tempfile.mktemp(suffix=".png")
+        PILImage.new("RGB", (800, 1200), (200, 200, 200)).save(p)
+        return p
+
 class Star:
     _shared_kv: dict = {}
 
@@ -260,6 +269,72 @@ class TestExtractArgs(unittest.TestCase):
         self.assertEqual(out, "夜宵烧烤 50")
 
 
+class TestImageCompression(unittest.TestCase):
+    """图片压缩：大图转述前先压缩，避免撑爆小模型 context"""
+
+    def _plugin(self, cfg=None):
+        ctx = Context()
+        ctx.providers = [FakeProvider("text-y", "gpt-4o")]
+
+        async def llm(**kw):
+            return types.SimpleNamespace(completion_text="早点铺：豆浆2元 包子6元")
+
+        ctx.llm_generate = llm
+        return plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig(cfg or {}))
+
+    def test_transcribe_sends_compressed_data_url(self):
+        """转述模型收到的图片是压缩后的 data URL，且请求带图"""
+
+        async def run():
+            calls = []
+            ctx = Context()
+
+            async def llm(**kw):
+                calls.append(kw)
+                return types.SimpleNamespace(completion_text="转述文字")
+
+            ctx.llm_generate = llm
+            p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({"vision_max_side": 300}))
+            text, err = await p._transcribe_images("vision-x", [Image(url="https://img/b.jpg")])
+            self.assertIsNone(err)
+            self.assertEqual(text, "转述文字")
+            urls = calls[0]["image_urls"]
+            self.assertEqual(len(urls), 1)
+            self.assertTrue(urls[0].startswith("data:image/jpeg;base64,"))
+        asyncio.run(run())
+
+    def test_compress_reduces_size(self):
+        """800x1200 的图压到最长边 300 后，base64 明显变小"""
+
+        def run():
+            p = self._plugin({"vision_max_side": 300, "vision_jpeg_quality": 60})
+            from PIL import Image as PILImage
+            import tempfile
+
+            big = tempfile.mktemp(suffix=".png")
+            PILImage.new("RGB", (800, 1200), (200, 200, 200)).save(big)
+            data_url = p._compress_image_to_base64(big)
+            self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+            # 压缩后 payload 应该很小（远小于原始 PNG）
+            payload = data_url.split(",", 1)[1]
+            self.assertLess(len(payload), 20000)
+        run()
+
+    def test_prepare_failure_returns_none(self):
+        """图片处理失败（convert_to_file_path 抛异常）返回 None"""
+
+        async def run():
+            p = self._plugin()
+
+            class BadImage:
+                async def convert_to_file_path(self):
+                    raise RuntimeError("download failed")
+
+            out = await p._prepare_image_urls([BadImage()])
+            self.assertIsNone(out)
+        asyncio.run(run())
+
+
 class TestTwoStage(unittest.TestCase):
     """两阶段识别：图片转述模型 + 解析模型"""
 
@@ -274,10 +349,11 @@ class TestTwoStage(unittest.TestCase):
             async def llm(**kw):
                 calls.append(kw)
                 if kw.get("image_urls"):
-                    # 阶段1：图片转述模型
+                    # 阶段1：图片转述模型（收到的是压缩后的 data URL）
                     self.assertEqual(kw["chat_provider_id"], "vision-x")
                     self.assertIn("转述", kw["prompt"])
-                    self.assertEqual(kw["image_urls"], ["https://img/1.jpg"])
+                    self.assertEqual(len(kw["image_urls"]), 1)
+                    self.assertTrue(kw["image_urls"][0].startswith("data:image/jpeg;base64,"))
                     return types.SimpleNamespace(completion_text="早点铺：豆浆2元、包子6元，合计8元")
                 # 阶段2：解析模型（纯文字，不带图）
                 self.assertEqual(kw["chat_provider_id"], "text-y")
@@ -289,7 +365,7 @@ class TestTwoStage(unittest.TestCase):
 
             ctx.llm_generate = llm
             p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({}))
-            data = await p._parse_bill("text-y", "vision-x", "", ["https://img/1.jpg"])
+            data = await p._parse_bill("text-y", "vision-x", "", [Image(url="https://img/1.jpg")])
             self.assertNotIn("error", data)
             self.assertEqual(len(calls), 2)
             items, _ = p._validate_items(data)
@@ -311,9 +387,10 @@ class TestTwoStage(unittest.TestCase):
 
             ctx.llm_generate = llm
             p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({}))
-            data = await p._parse_bill("text-y", None, "", ["https://img/1.jpg"])
+            data = await p._parse_bill("text-y", None, "", [Image(url="https://img/1.jpg")])
             self.assertEqual(len(calls), 1)
             self.assertIn("image_urls", calls[0])
+            self.assertTrue(calls[0]["image_urls"][0].startswith("data:image/jpeg;base64,"))
 
         asyncio.run(run())
 
@@ -352,7 +429,7 @@ class TestTwoStage(unittest.TestCase):
 
             ctx.llm_generate = llm
             p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({}))
-            data = await p._parse_bill("text-y", "vision-x", "", ["https://img/1.jpg"])
+            data = await p._parse_bill("text-y", "vision-x", "", [Image(url="https://img/1.jpg")])
             self.assertIn("error", data)
             self.assertIn("图片转述失败", data["error"])
             self.assertEqual(len(calls), 1)

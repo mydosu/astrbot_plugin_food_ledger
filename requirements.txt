@@ -1,1 +1,2 @@
-# 本插件无第三方依赖（使用 Python 标准库 sqlite3 存储数据）
+# 图片压缩用（AstrBot 自带 pillow，此声明仅为插件独立安装时兜底）
+pillow>=11.2.1

@@ -189,15 +189,9 @@ class FoodLedgerPlugin(Star):
         return m.group(3).strip() if m else ""
 
     @staticmethod
-    def _get_image_urls(event: AstrMessageEvent) -> list[str]:
-        """从消息链中提取所有图片的 URL（用于多模态识别）。"""
-        urls: list[str] = []
-        for comp in event.message_obj.message:
-            if isinstance(comp, Image):
-                u = comp.url or comp.file
-                if u:
-                    urls.append(u)
-        return urls
+    def _get_images(event: AstrMessageEvent) -> list[Image]:
+        """从消息链中提取所有图片组件（保留对象，便于取本地文件做压缩）。"""
+        return [comp for comp in event.message_obj.message if isinstance(comp, Image)]
 
     def _get_categories(self) -> list[str]:
         """读取配置中的类别列表，保证至少包含「其他」。"""
@@ -233,24 +227,26 @@ class FoodLedgerPlugin(Star):
         text_provider_id: str,
         vision_provider_id: Optional[str],
         text: str,
-        image_urls: list[str],
+        images: list[Image],
     ) -> dict:
         """两阶段识别账单，返回解析后的 JSON dict 或 {"error": ...}。
 
-        - 有图片：先由「图片转述模型」把图片转成文字描述；
+        - 有图片：先由「图片转述模型」把图片转成文字描述（图片会先压缩，
+          微信截图这类原图很大，小模型的上下文往往装不下）；
         - 再由「解析模型」把全部文字（用户描述 + 图片转述）整理成结构化账目。
         - 未配置图片转述模型时，回退为让解析模型直接看图（若其支持多模态）。
         """
         transcribed: Optional[str] = None
-        if image_urls:
+        if images:
             if vision_provider_id:
-                transcribed, err = await self._transcribe_images(
-                    vision_provider_id, image_urls
-                )
+                transcribed, err = await self._transcribe_images(vision_provider_id, images)
                 if err:
                     return {"error": err}
             else:
                 logger.info("未配置图片转述模型，尝试用解析模型直接识别图片")
+                image_urls = await self._prepare_image_urls(images)
+                if image_urls is None:
+                    return {"error": "图片处理失败（下载或压缩出错）"}
                 return await self._llm_parse(
                     text_provider_id, text or "（图片账单，请仔细识别图片中的消费明细）", image_urls
                 )
@@ -263,9 +259,15 @@ class FoodLedgerPlugin(Star):
         return await self._llm_parse(text_provider_id, content)
 
     async def _transcribe_images(
-        self, vision_provider_id: str, image_urls: list[str]
+        self, vision_provider_id: str, images: list[Image]
     ) -> tuple[Optional[str], Optional[str]]:
-        """调用图片转述模型把图片转成文字，返回 (转述文本, 错误信息)。"""
+        """调用图片转述模型把图片转成文字，返回 (转述文本, 错误信息)。
+
+        图片会先压缩，避免大图把模型的上下文塞爆（本地小模型 context 通常只有 2k）。
+        """
+        image_urls = await self._prepare_image_urls(images)
+        if image_urls is None:
+            return None, "图片处理失败（下载或压缩出错）"
         try:
             resp = await self.context.llm_generate(
                 chat_provider_id=vision_provider_id,
@@ -276,6 +278,42 @@ class FoodLedgerPlugin(Star):
         except Exception as e:
             logger.error(f"图片转述失败: {e}")
             return None, f"图片转述失败（{vision_provider_id}）：{e}"
+
+    async def _prepare_image_urls(self, images: list[Image]) -> Optional[list[str]]:
+        """把图片组件统一转成压缩后的 data URL 列表；任何一张处理失败返回 None。"""
+        urls: list[str] = []
+        for img in images:
+            try:
+                path = await img.convert_to_file_path()
+                urls.append(self._compress_image_to_base64(path))
+            except Exception as e:
+                logger.warning(f"图片处理失败: {e}")
+                return None
+        return urls
+
+    def _compress_image_to_base64(self, path: str) -> str:
+        """把本地图片压缩（最长边 ≤ 配置值，JPEG）并返回 data URL。
+
+        微信账单截图分辨率很高，直接 base64 传给小模型会把 context 撑爆。
+        """
+        from PIL import Image as PILImage
+
+        max_side = int(self.config.get("vision_max_side") or 768)
+        quality = int(self.config.get("vision_jpeg_quality") or 80)
+        with PILImage.open(path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            scale = max_side / max(w, h)
+            if scale < 1:
+                im = im.resize(
+                    (max(1, int(w * scale)), max(1, int(h * scale))), PILImage.LANCZOS
+                )
+            import base64
+            import io
+
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=quality)
+            return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
 
     async def _llm_parse(
         self, provider_id: str, content: str, image_urls: Optional[list[str]] = None
@@ -431,8 +469,8 @@ class FoodLedgerPlugin(Star):
         """
         if not self.config.get("auto_image_ledger", True):
             return
-        image_urls = self._get_image_urls(event)
-        if not image_urls:
+        images = self._get_images(event)
+        if not images:
             logger.debug("[记账] 消息无图片，跳过自动识别")
             return
         text = event.message_str.strip()
@@ -443,8 +481,8 @@ class FoodLedgerPlugin(Star):
         if re.match(r"^[/／]?\s*(记账|ledger|账本)", text, re.I):
             return
         await self._ensure_drafts()
-        logger.info(f"[记账] 收到图片消息，共 {len(image_urls)} 张，尝试自动识别")
-        draft, warnings, err, err_kind = await self._recognize(event, text, image_urls)
+        logger.info(f"[记账] 收到图片消息，共 {len(images)} 张，尝试自动识别")
+        draft, warnings, err, err_kind = await self._recognize(event, text, images)
         if err:
             if err_kind == "config":
                 # 配置或模型问题：提示用户，但仍放行给 AstrBot 正常处理
@@ -457,7 +495,7 @@ class FoodLedgerPlugin(Star):
         event.stop_event()
 
     async def _recognize(
-        self, event: AstrMessageEvent, text: str, image_urls: list[str]
+        self, event: AstrMessageEvent, text: str, images: list[Image]
     ) -> tuple[Optional[dict], list[str], Optional[str], Optional[str]]:
         """识别账单并生成待确认草稿（指令和自动识别共用）。
 
@@ -472,10 +510,10 @@ class FoodLedgerPlugin(Star):
             return None, [], "未找到可用的解析模型。请在 AstrBot WebUI 插件配置中设置「账单解析模型」。", "config"
         vision_provider_id = self._get_vision_provider()
         warnings: list[str] = []
-        if image_urls and not vision_provider_id:
+        if images and not vision_provider_id:
             warnings.append("尚未配置「图片转述模型」，正在用解析模型直接识别图片，效果可能一般")
         logger.info(f"[记账] 图片转述模型: {vision_provider_id or '未配置（回退给解析模型）'}，解析模型: {provider_id}")
-        data = await self._parse_bill(provider_id, vision_provider_id, text, image_urls)
+        data = await self._parse_bill(provider_id, vision_provider_id, text, images)
         if data.get("error"):
             return None, [], f"识别失败：{data['error']}", "config"
         items, validate_warnings = self._validate_items(data)
@@ -503,9 +541,9 @@ class FoodLedgerPlugin(Star):
         """识别并记录账单：/记账 记 <文字或账单图片>"""
         await self._ensure_drafts()
         args = self._extract_args(event, ("记", "record", "add", "记一笔"))
-        image_urls = self._get_image_urls(event)
+        images = self._get_images(event)
         text = args
-        if not text and not image_urls:
+        if not text and not images:
             yield event.plain_result(
                 "📝 请发送账单内容，例如：\n"
                 "· /记账 记 早餐包子豆浆 8.5 元\n"
@@ -514,7 +552,7 @@ class FoodLedgerPlugin(Star):
             )
             return
         yield event.plain_result("🧾 正在识别账单，请稍候…")
-        draft, warnings, err, _ = await self._recognize(event, text, image_urls)
+        draft, warnings, err, _ = await self._recognize(event, text, images)
         if err:
             yield event.plain_result("❌ " + err)
             return

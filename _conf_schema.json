@@ -30,5 +30,15 @@
     "description": "金额单位符号，用于查账统计展示",
     "type": "string",
     "default": "元"
+  },
+  "vision_max_side": {
+    "description": "图片转述前压缩的最长边像素。微信截图原图很大，压缩后可大幅减少 token（本地小模型 context 往往只有 2k）；值越小越省，清晰度略降",
+    "type": "int",
+    "default": 768
+  },
+  "vision_jpeg_quality": {
+    "description": "图片压缩的 JPEG 质量（1-100）",
+    "type": "int",
+    "default": 80
   }
 }
