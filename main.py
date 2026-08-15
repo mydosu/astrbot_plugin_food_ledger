@@ -47,19 +47,21 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个专业的餐饮记账助手。用户会�
 3. 一张账单可能包含多笔（如小票有多行），请逐笔提取，不要合并。
 4. 金额以元为单位；如果账单上是外币或单位异常，按字面数字记录并在 description 中注明。
 5. 识别不出的模糊项不要瞎编，直接跳过。
-6. 如果用户明确说了「AA」「每人」「人均」，按人均金额记录并在 description 中注明。"""
+6. 如果用户明确说了「AA」「每人」「人均」，按人均金额记录并在 description 中注明。
+7. 如果内容中识别不出任何有效消费，items 输出空数组 []；无论如何只输出 JSON，禁止输出任何解释、抱歉或额外文字。"""
 
-USER_PROMPT_TEMPLATE = """请识别以下餐饮账单并输出 JSON：
+USER_PROMPT_TEMPLATE = """请识别以下餐饮账单并输出 JSON（只输出 JSON 对象本身，不要代码块标记，不要任何其他文字）：
 {content}"""
 
-# 图片转述模型用的提示词：把账单图片转成文字描述
-VISION_TRANSCRIBE_PROMPT = """请仔细查看这张图片，这是一张餐饮消费相关的账单/小票/支付截图。
-请将图片中所有文字内容完整转述出来，尤其是：
-- 每一笔消费的项目名称和金额
-- 商家/店铺名称
-- 日期时间
-- 合计金额
-按原始排版分行输出，不要添加任何分析或评论。如果图片不清晰或无法识别，请直接说明。"""
+# 图片转述模型用的提示词：把账单图片转成紧凑文字（省 token、方便后续解析）
+VISION_TRANSCRIBE_PROMPT = """请转述这张餐饮账单图片（小票/支付截图）里的全部文字内容。
+要求：
+- 每行一条消费：项目名称 + 金额数字，如：牛肉面 25
+- 最后一行写：合计 <金额>
+- 商家名、日期如有也写出来
+- 只输出文字内容，不要任何分析或评论
+- 看不清的字用 ? 代替
+- 图片里没有文字时，只输出：无文字"""
 
 
 class FoodLedgerPlugin(Star):
@@ -334,7 +336,12 @@ class FoodLedgerPlugin(Star):
         except Exception as e:
             logger.error(f"LLM 调用失败: {e}")
             return {"error": str(e)}
-        return self._parse_llm_json(resp.completion_text)
+        parsed = self._parse_llm_json(resp.completion_text)
+        if parsed.get("error"):
+            snippet = (resp.completion_text or "").strip()[:120]
+            logger.warning(f"[记账] 解析模型输出无法解析为 JSON，原文开头: {snippet!r}")
+            parsed["error"] = f"{parsed['error']}（模型回复开头：{snippet!r}）"
+        return parsed
 
     @staticmethod
     def _parse_llm_json(text: str) -> dict:
@@ -481,6 +488,7 @@ class FoodLedgerPlugin(Star):
         if re.match(r"^[/／]?\s*(记账|ledger|账本)", text, re.I):
             return
         await self._ensure_drafts()
+        yield event.plain_result("🧾 收到图片，正在识别账单，可能需要一点时间…")
         logger.info(f"[记账] 收到图片消息，共 {len(images)} 张，尝试自动识别")
         draft, warnings, err, err_kind = await self._recognize(event, text, images)
         if err:

@@ -529,7 +529,10 @@ class TestAutoLedger(unittest.TestCase):
             p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({}))
             ev = AstrMessageEvent(message_str="", message=[Image(url="https://img/cat.jpg")], umo="t:g:auto7")
             out = [r async for r in p.on_any_message(ev)]
-            self.assertEqual(out, [])
+            # 只有「正在识别」的即时反馈，没有草稿，也没有失败提示（内容类失败静默）
+            self.assertTrue(any("正在识别" in str(r) for r in out))
+            self.assertFalse(any("待确认" in str(r) for r in out))
+            self.assertFalse(any("没成功" in str(r) for r in out))
             self.assertFalse(ev._stopped)
         asyncio.run(run())
 
