@@ -249,9 +249,9 @@ class FoodLedgerPlugin(Star):
                     return {"error": "图片转述模型没有识别到任何文字。请检查 llama.cpp 是否加载了视觉投影文件（--mmproj，否则模型看不到图片），或换一个视觉模型"}
             else:
                 logger.info("未配置图片转述模型，尝试用解析模型直接识别图片")
-                image_urls = await self._prepare_image_chunks(images)
+                image_urls = await self._prepare_image_urls(images)
                 if image_urls is None:
-                    return {"error": "图片处理失败（下载或压缩出错）"}
+                    return {"error": "图片处理失败（下载出错）"}
                 return await self._llm_parse(
                     text_provider_id, text or "（图片账单，请仔细识别图片中的消费明细）", image_urls
                 )
@@ -268,82 +268,48 @@ class FoodLedgerPlugin(Star):
     ) -> tuple[Optional[str], Optional[str]]:
         """调用图片转述模型把图片转成文字，返回 (转述文本, 错误信息)。
 
-        图片先压缩，超长截图切成多块，每块单独转述后合并（避免长图看不全）。
+        原图直出：把原始图片直接发给转述模型（llama.cpp 会自行缩放处理）。
         """
-        chunks = await self._prepare_image_chunks(images)
-        if chunks is None:
-            return None, "图片处理失败（下载或压缩出错）"
-        logger.info(f"[记账] 发送给转述模型的图片块: {len(chunks)} 块")
-        texts: list[str] = []
+        image_urls = await self._prepare_image_urls(images)
+        if image_urls is None:
+            return None, "图片处理失败（下载出错）"
+        logger.info(f"[记账] 发送给转述模型的图片: {len(image_urls)} 张（原图直出）")
         try:
-            for i, url in enumerate(chunks, 1):
-                prompt = VISION_TRANSCRIBE_PROMPT
-                if len(chunks) > 1:
-                    prompt = f"这是账单截图第 {i}/{len(chunks)} 块。\n" + VISION_TRANSCRIBE_PROMPT
-                resp = await self.context.llm_generate(
-                    chat_provider_id=vision_provider_id,
-                    prompt=prompt,
-                    image_urls=[url],
-                )
-                texts.append((resp.completion_text or "").strip())
+            resp = await self.context.llm_generate(
+                chat_provider_id=vision_provider_id,
+                prompt=VISION_TRANSCRIBE_PROMPT,
+                image_urls=image_urls,
+            )
+            return resp.completion_text, None
         except Exception as e:
             logger.error(f"图片转述失败: {e}")
             return None, f"图片转述失败（{vision_provider_id}）：{e}"
-        merged = "\n".join(t for t in texts if t)
-        return (merged or None), None
 
-    async def _prepare_image_chunks(self, images: list[Image]) -> Optional[list[str]]:
-        """把图片组件统一转成压缩/切块后的 data URL 列表；任何一张处理失败返回 None。"""
+    async def _prepare_image_urls(self, images: list[Image]) -> Optional[list[str]]:
+        """把图片组件统一转成 data URL 列表（原图直出，不压缩不切块）。
+
+        任何一张图片处理失败返回 None。
+        """
         urls: list[str] = []
         for img in images:
             try:
                 path = await img.convert_to_file_path()
-                urls.extend(self._slice_image_to_data_urls(path))
+                urls.append(self._image_file_to_data_url(path))
             except Exception as e:
                 logger.warning(f"图片处理失败: {e}")
                 return None
         return urls
 
-    def _slice_image_to_data_urls(self, path: str) -> list[str]:
-        """把图片压缩，超长图（聊天记录长截图）切成多块，返回 data URL 列表。
-
-        微信长截图动辄上万像素高：整张压成小图字会糊成一团（模型只认得出开头），
-        切成多块逐块识别，每块文字都清晰。
-        """
-        from PIL import Image as PILImage
-
-        max_side = int(self.config.get("vision_max_side") or 768)
-        quality = int(self.config.get("vision_jpeg_quality") or 80)
-        chunk_h = int(self.config.get("vision_chunk_height") or 1536)
+    @staticmethod
+    def _image_file_to_data_url(path: str) -> str:
+        """读本地图片文件，原样转成 data URL（不做压缩/缩放）。"""
         import base64
-        import io
-        import math
+        import mimetypes
+        from pathlib import Path
 
-        def _to_data_url(pil_img: PILImage.Image) -> str:
-            w, h = pil_img.size
-            scale = max_side / max(w, h)
-            if scale < 1:
-                pil_img = pil_img.resize(
-                    (max(1, int(w * scale)), max(1, int(h * scale))), PILImage.LANCZOS
-                )
-            buf = io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=quality)
-            return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
-
-        with PILImage.open(path) as im:
-            im = im.convert("RGB")
-            w, h = im.size
-            if h > chunk_h and h / w > 2.0:
-                # 超长截图：按高度均分切成多块
-                n = math.ceil(h / chunk_h)
-                step = h // n
-                urls = []
-                for i in range(n):
-                    top = i * step
-                    bottom = h if i == n - 1 else (i + 1) * step
-                    urls.append(_to_data_url(im.crop((0, top, w, bottom))))
-                return urls
-            return [_to_data_url(im)]
+        mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+        data = Path(path).read_bytes()
+        return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
     async def _llm_parse(
         self, provider_id: str, content: str, image_urls: Optional[list[str]] = None

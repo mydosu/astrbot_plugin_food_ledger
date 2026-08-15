@@ -269,8 +269,8 @@ class TestExtractArgs(unittest.TestCase):
         self.assertEqual(out, "夜宵烧烤 50")
 
 
-class TestImageCompression(unittest.TestCase):
-    """图片压缩：大图转述前先压缩，避免撑爆小模型 context"""
+class TestImageDirect(unittest.TestCase):
+    """图片原图直出：不压缩不切块，直接把原图发给转述模型"""
 
     def _plugin(self, cfg=None):
         ctx = Context()
@@ -282,8 +282,8 @@ class TestImageCompression(unittest.TestCase):
         ctx.llm_generate = llm
         return plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig(cfg or {}))
 
-    def test_transcribe_sends_compressed_data_url(self):
-        """转述模型收到的图片是压缩后的 data URL，且请求带图"""
+    def test_transcribe_sends_original_data_url(self):
+        """转述模型收到的是原图 data URL（一次调用）"""
 
         async def run():
             calls = []
@@ -294,32 +294,35 @@ class TestImageCompression(unittest.TestCase):
                 return types.SimpleNamespace(completion_text="转述文字")
 
             ctx.llm_generate = llm
-            p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({"vision_max_side": 300}))
+            p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({}))
             text, err = await p._transcribe_images("vision-x", [Image(url="https://img/b.jpg")])
             self.assertIsNone(err)
             self.assertEqual(text, "转述文字")
+            self.assertEqual(len(calls), 1)  # 原图直出：一次调用
             urls = calls[0]["image_urls"]
             self.assertEqual(len(urls), 1)
-            self.assertTrue(urls[0].startswith("data:image/jpeg;base64,"))
+            self.assertTrue(urls[0].startswith("data:image/"))
         asyncio.run(run())
 
-    def test_compress_reduces_size(self):
-        """800x1200 的图压到最长边 300 后，base64 明显变小"""
+    def test_multiple_images_one_call(self):
+        """多张图一次调用，image_urls 数量对应"""
 
-        def run():
-            p = self._plugin({"vision_max_side": 300, "vision_jpeg_quality": 60})
-            from PIL import Image as PILImage
-            import tempfile
+        async def run():
+            calls = []
+            ctx = Context()
 
-            big = tempfile.mktemp(suffix=".png")
-            PILImage.new("RGB", (800, 1200), (200, 200, 200)).save(big)
-            urls = p._slice_image_to_data_urls(big)
-            data_url = urls[0]
-            self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
-            # 压缩后 payload 应该很小（远小于原始 PNG）
-            payload = data_url.split(",", 1)[1]
-            self.assertLess(len(payload), 20000)
-        run()
+            async def llm(**kw):
+                calls.append(kw)
+                return types.SimpleNamespace(completion_text="ok")
+
+            ctx.llm_generate = llm
+            p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({}))
+            text, err = await p._transcribe_images(
+                "vision-x", [Image(url="https://img/a.jpg"), Image(url="https://img/b.jpg")]
+            )
+            self.assertIsNone(err)
+            self.assertEqual(len(calls[0]["image_urls"]), 2)
+        asyncio.run(run())
 
     def test_prepare_failure_returns_none(self):
         """图片处理失败（convert_to_file_path 抛异常）返回 None"""
@@ -331,12 +334,12 @@ class TestImageCompression(unittest.TestCase):
                 async def convert_to_file_path(self):
                     raise RuntimeError("download failed")
 
-            out = await p._prepare_image_chunks([BadImage()])
+            out = await p._prepare_image_urls([BadImage()])
             self.assertIsNone(out)
         asyncio.run(run())
 
-    def test_slice_regular_image_single_chunk(self):
-        """普通比例图不切块"""
+    def test_image_file_to_data_url_original(self):
+        """原图文件转 data URL：尺寸/字节不变（不压缩）"""
 
         def run():
             p = self._plugin()
@@ -344,58 +347,15 @@ class TestImageCompression(unittest.TestCase):
             import tempfile
 
             f = tempfile.mktemp(suffix=".png")
-            PILImage.new("RGB", (800, 600), (255, 255, 255)).save(f)
-            urls = p._slice_image_to_data_urls(f)
-            self.assertEqual(len(urls), 1)
-            self.assertTrue(urls[0].startswith("data:image/jpeg;base64,"))
+            PILImage.new("RGB", (800, 1200), (200, 200, 200)).save(f)
+            data_url = p._image_file_to_data_url(f)
+            self.assertTrue(data_url.startswith("data:image/png;base64,"))
+            import base64
+            payload = data_url.split(",", 1)[1]
+            # 原图未压缩：解码字节数应等于 PNG 文件大小
+            decoded = len(base64.b64decode(payload))
+            self.assertGreater(decoded, 1000)
         run()
-
-    def test_slice_tall_screenshot_multiple_chunks(self):
-        """超长截图（400x3000）切成多块"""
-
-        def run():
-            p = self._plugin({"vision_chunk_height": 1536})
-            from PIL import Image as PILImage
-            import tempfile
-
-            f = tempfile.mktemp(suffix=".png")
-            PILImage.new("RGB", (400, 3000), (255, 255, 255)).save(f)
-            urls = p._slice_image_to_data_urls(f)
-            self.assertGreaterEqual(len(urls), 2)
-            for u in urls:
-                self.assertTrue(u.startswith("data:image/jpeg;base64,"))
-        run()
-
-    def test_transcribe_multiple_chunks_merged(self):
-        """多块转述：每块单独调用一次，结果合并"""
-
-        async def run():
-            calls = []
-            ctx = Context()
-
-            async def llm(**kw):
-                calls.append(kw)
-                self.assertEqual(len(kw["image_urls"]), 1)  # 每块单独一张
-                return types.SimpleNamespace(completion_text=f"块内容{len(calls)}")
-
-            ctx.llm_generate = llm
-            p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({"vision_chunk_height": 1536}))
-
-            class TallImage:
-                async def convert_to_file_path(self):
-                    from PIL import Image as PILImage
-                    import tempfile
-
-                    f = tempfile.mktemp(suffix=".png")
-                    PILImage.new("RGB", (400, 3200), (255, 255, 255)).save(f)
-                    return f
-
-            text, err = await p._transcribe_images("vision-x", [TallImage()])
-            self.assertIsNone(err)
-            self.assertEqual(len(calls), 3)  # ceil(3200/1536) = 3 块
-            self.assertIn("块内容1", text)
-            self.assertIn("块内容3", text)
-        asyncio.run(run())
 
 
 class TestTwoStage(unittest.TestCase):
@@ -416,7 +376,7 @@ class TestTwoStage(unittest.TestCase):
                     self.assertEqual(kw["chat_provider_id"], "vision-x")
                     self.assertIn("转述", kw["prompt"])
                     self.assertEqual(len(kw["image_urls"]), 1)
-                    self.assertTrue(kw["image_urls"][0].startswith("data:image/jpeg;base64,"))
+                    self.assertTrue(kw["image_urls"][0].startswith("data:image/"))
                     return types.SimpleNamespace(completion_text="早点铺：豆浆2元、包子6元，合计8元")
                 # 阶段2：解析模型（纯文字，不带图）
                 self.assertEqual(kw["chat_provider_id"], "text-y")
@@ -453,7 +413,7 @@ class TestTwoStage(unittest.TestCase):
             data = await p._parse_bill("text-y", None, "", [Image(url="https://img/1.jpg")])
             self.assertEqual(len(calls), 1)
             self.assertIn("image_urls", calls[0])
-            self.assertTrue(calls[0]["image_urls"][0].startswith("data:image/jpeg;base64,"))
+            self.assertTrue(calls[0]["image_urls"][0].startswith("data:image/"))
 
         asyncio.run(run())
 
