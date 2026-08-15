@@ -40,5 +40,10 @@
     "description": "图片压缩的 JPEG 质量（1-100）",
     "type": "int",
     "default": 80
+  },
+  "vision_chunk_height": {
+    "description": "超长截图切块高度（像素）。微信聊天记录长截图上万像素，整张压小会看不清；超过此高度且高宽比>2 的图会切成多块逐块识别（默认 1536）",
+    "type": "int",
+    "default": 1536
   }
 }

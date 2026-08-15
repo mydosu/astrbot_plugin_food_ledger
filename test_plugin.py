@@ -313,7 +313,8 @@ class TestImageCompression(unittest.TestCase):
 
             big = tempfile.mktemp(suffix=".png")
             PILImage.new("RGB", (800, 1200), (200, 200, 200)).save(big)
-            data_url = p._compress_image_to_base64(big)
+            urls = p._slice_image_to_data_urls(big)
+            data_url = urls[0]
             self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
             # 压缩后 payload 应该很小（远小于原始 PNG）
             payload = data_url.split(",", 1)[1]
@@ -330,8 +331,70 @@ class TestImageCompression(unittest.TestCase):
                 async def convert_to_file_path(self):
                     raise RuntimeError("download failed")
 
-            out = await p._prepare_image_urls([BadImage()])
+            out = await p._prepare_image_chunks([BadImage()])
             self.assertIsNone(out)
+        asyncio.run(run())
+
+    def test_slice_regular_image_single_chunk(self):
+        """普通比例图不切块"""
+
+        def run():
+            p = self._plugin()
+            from PIL import Image as PILImage
+            import tempfile
+
+            f = tempfile.mktemp(suffix=".png")
+            PILImage.new("RGB", (800, 600), (255, 255, 255)).save(f)
+            urls = p._slice_image_to_data_urls(f)
+            self.assertEqual(len(urls), 1)
+            self.assertTrue(urls[0].startswith("data:image/jpeg;base64,"))
+        run()
+
+    def test_slice_tall_screenshot_multiple_chunks(self):
+        """超长截图（400x3000）切成多块"""
+
+        def run():
+            p = self._plugin({"vision_chunk_height": 1536})
+            from PIL import Image as PILImage
+            import tempfile
+
+            f = tempfile.mktemp(suffix=".png")
+            PILImage.new("RGB", (400, 3000), (255, 255, 255)).save(f)
+            urls = p._slice_image_to_data_urls(f)
+            self.assertGreaterEqual(len(urls), 2)
+            for u in urls:
+                self.assertTrue(u.startswith("data:image/jpeg;base64,"))
+        run()
+
+    def test_transcribe_multiple_chunks_merged(self):
+        """多块转述：每块单独调用一次，结果合并"""
+
+        async def run():
+            calls = []
+            ctx = Context()
+
+            async def llm(**kw):
+                calls.append(kw)
+                self.assertEqual(len(kw["image_urls"]), 1)  # 每块单独一张
+                return types.SimpleNamespace(completion_text=f"块内容{len(calls)}")
+
+            ctx.llm_generate = llm
+            p = plugin_mod.FoodLedgerPlugin(ctx, AstrBotConfig({"vision_chunk_height": 1536}))
+
+            class TallImage:
+                async def convert_to_file_path(self):
+                    from PIL import Image as PILImage
+                    import tempfile
+
+                    f = tempfile.mktemp(suffix=".png")
+                    PILImage.new("RGB", (400, 3200), (255, 255, 255)).save(f)
+                    return f
+
+            text, err = await p._transcribe_images("vision-x", [TallImage()])
+            self.assertIsNone(err)
+            self.assertEqual(len(calls), 3)  # ceil(3200/1536) = 3 块
+            self.assertIn("块内容1", text)
+            self.assertIn("块内容3", text)
         asyncio.run(run())
 
 
