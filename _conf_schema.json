@@ -30,5 +30,15 @@
     "description": "金额单位符号，用于查账统计展示",
     "type": "string",
     "default": "元"
+  },
+  "shops": {
+    "description": "店铺列表，逗号分隔。确认记账时需要选择店铺（如：熊大爷,曼玲粥）",
+    "type": "string",
+    "default": "熊大爷,曼玲粥"
+  },
+  "default_shop": {
+    "description": "默认店铺：确认记账时省略店铺名则记入此店；留空则在多个店铺时提示选择",
+    "type": "string",
+    "default": ""
   }
 }

@@ -102,6 +102,7 @@ class FoodLedgerPlugin(Star):
                     id                INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id           TEXT    NOT NULL,
                     session_id        TEXT    NOT NULL,
+                    shop              TEXT    DEFAULT '',
                     category          TEXT    NOT NULL,
                     amount            REAL    NOT NULL,
                     description       TEXT    DEFAULT '',
@@ -113,6 +114,10 @@ class FoodLedgerPlugin(Star):
                 )
                 """
             )
+            # 老库迁移：补 shop 列（早期版本没有）
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(records)").fetchall()]
+            if "shop" not in cols:
+                conn.execute("ALTER TABLE records ADD COLUMN shop TEXT DEFAULT ''")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_records_user_date ON records(user_id, record_date)"
             )
@@ -125,9 +130,9 @@ class FoodLedgerPlugin(Star):
         conn = self._get_conn()
         try:
             cur = conn.executemany(
-                "INSERT INTO records (user_id, session_id, category, amount, description, "
+                "INSERT INTO records (user_id, session_id, shop, category, amount, description, "
                 "record_date, created_at, raw_message, provider_id, vision_provider_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
             conn.commit()
@@ -136,9 +141,14 @@ class FoodLedgerPlugin(Star):
             conn.close()
 
     def _query_records(
-        self, user_id: str, start: str, end: str, category: Optional[str] = None
+        self,
+        user_id: str,
+        start: str,
+        end: str,
+        category: Optional[str] = None,
+        shop: Optional[str] = None,
     ) -> list[sqlite3.Row]:
-        """按用户、日期范围（含端点）、可选类别查询记录。"""
+        """按用户、日期范围（含端点）、可选类别/店铺查询记录。"""
         conn = self._get_conn()
         try:
             sql = (
@@ -148,8 +158,30 @@ class FoodLedgerPlugin(Star):
             if category:
                 sql += " AND category=?"
                 params.append(category)
+            if shop:
+                sql += " AND shop=?"
+                params.append(shop)
             # TODO: 目前只取最近 200 条，账目多了之后考虑加分页
             sql += " ORDER BY record_date DESC, created_at DESC LIMIT 200"
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+    def _monthly_query(
+        self, user_id: str, year: int, shop: Optional[str] = None
+    ) -> list[sqlite3.Row]:
+        """按月统计某年的支出（YYYY-MM → 笔数/总额）。"""
+        conn = self._get_conn()
+        try:
+            sql = (
+                "SELECT substr(record_date, 1, 7) AS ym, COUNT(*) AS cnt, "
+                "SUM(amount) AS total FROM records WHERE user_id=? AND record_date LIKE ?"
+            )
+            params: list[Any] = [user_id, f"{year}-%"]
+            if shop:
+                sql += " AND shop=?"
+                params.append(shop)
+            sql += " GROUP BY ym ORDER BY ym"
             return conn.execute(sql, params).fetchall()
         finally:
             conn.close()
@@ -202,6 +234,11 @@ class FoodLedgerPlugin(Star):
         if "其他" not in cats:
             cats.append("其他")
         return cats
+
+    def _get_shops(self) -> list[str]:
+        """读取配置中的店铺列表（确认记账时选择）。"""
+        raw = self.config.get("shops") or ""
+        return [s.strip() for s in str(raw).replace("，", ",").split(",") if s.strip()]
 
     async def _resolve_text_provider(self, umo: str) -> Optional[str]:
         """解析本次「账单解析模型」（文本 → 结构化账目）。
@@ -422,11 +459,16 @@ class FoodLedgerPlugin(Star):
         return "\n".join(lines)
 
     def _format_query_result(
-        self, start: str, end: str, rows: list[sqlite3.Row], category: Optional[str]
+        self,
+        start: str,
+        end: str,
+        rows: list[sqlite3.Row],
+        category: Optional[str] = None,
+        shop: Optional[str] = None,
     ) -> str:
         currency = str(self.config.get("currency_symbol") or "元")
         total = sum(r["amount"] for r in rows)
-        lines = ["📊 餐饮账目统计"]
+        lines = ["📊 餐饮账目统计" + (f"（{shop}）" if shop else "")]
         lines.append(f"📅 {start} ~ {end}" + (f"｜类别：{category}" if category else ""))
         lines.append(f"💰 总支出：{total:.2f} {currency}（{len(rows)} 笔）")
         if not rows:
@@ -443,8 +485,9 @@ class FoodLedgerPlugin(Star):
 
         lines.append("\n📋 明细：")
         for idx, r in enumerate(reversed(rows), 1):  # 倒序查询，反转回时间正序
+            shop_tag = f"[{r['shop']}] " if r["shop"] and not shop else ""
             lines.append(
-                f"#{idx} {self._fmt_dt(r['created_at'])} {r['category']} {r['amount']:.2f} {r['description'] or '—'}"
+                f"#{idx} {self._fmt_dt(r['created_at'])} {shop_tag}{r['category']} {r['amount']:.2f} {r['description'] or '—'}"
             )
         lines.append("\n提示：可查询昨天/本月/上月，如「/记账 查账 本月」")
         return "\n".join(lines)
@@ -563,13 +606,36 @@ class FoodLedgerPlugin(Star):
     # ---------- 确认：入账 ----------
     @ledger.command("确认", alias={"确认入账", "ok", "commit"})
     async def confirm(self, event: AstrMessageEvent):
-        """确认草稿并写入数据库：/记账 确认"""
+        """确认草稿并写入数据库：/记账 确认 [店铺名]"""
         await self._ensure_drafts()
         umo = event.unified_msg_origin
         draft = self._drafts.get(umo)
         if not draft:
             yield event.plain_result("❌ 当前没有待确认的账单。请先发送「/记账 记 …」或账单图片。")
             return
+        args = self._extract_args(event, ("确认", "确认入账", "ok", "commit"))
+        shops = self._get_shops()
+        shop = args.strip()
+        if shop:
+            if shops and shop not in shops:
+                yield event.plain_result(
+                    f"❌ 店铺「{shop}」不存在。可用店铺：{'、'.join(shops)}\n"
+                    f"（也可在插件配置里修改店铺列表）"
+                )
+                return
+        else:
+            default_shop = str(self.config.get("default_shop") or "").strip()
+            if default_shop:
+                shop = default_shop
+            elif len(shops) == 1:
+                shop = shops[0]
+            else:
+                shop_list = "、".join(shops) if shops else "（未配置店铺）"
+                yield event.plain_result(
+                    f"🏪 这笔账记到哪个店？\n{shop_list}\n\n"
+                    f"回复：/记账 确认 {' 或 /记账 确认 '.join(shops[:2]) if len(shops) >= 2 else ''}"
+                )
+                return
         items = draft["items"]
         rd = draft.get("record_date") or date.today().isoformat()
         now = int(time.time())
@@ -577,6 +643,7 @@ class FoodLedgerPlugin(Star):
             (
                 event.get_sender_id(),
                 umo,
+                shop,
                 it["category"],
                 it["amount"],
                 it["description"],
@@ -599,7 +666,7 @@ class FoodLedgerPlugin(Star):
         total = sum(it["amount"] for it in items)
         currency = str(self.config.get("currency_symbol") or "元")
         yield event.plain_result(
-            f"✅ 已入账 {n} 笔，共 {total:.2f} {currency}（{rd}，{self._fmt_dt(now)} 记）\n"
+            f"✅ 已入账 {n} 笔，共 {total:.2f} {currency}（{shop}｜{rd}，{self._fmt_dt(now)} 记）\n"
             f"「/记账 查账」查看统计，或直接发图片继续记账。"
         )
 
@@ -674,64 +741,115 @@ class FoodLedgerPlugin(Star):
     # ---------- 查账 ----------
     @ledger.command("查账", alias={"查看", "查询", "账单", "stats"})
     async def query(self, event: AstrMessageEvent):
-        """查账：/记账 查账 [今天|昨天|本月|上月|YYYY-MM-DD|起始日 结束日] [类别]"""
+        """查账：/记账 查账 [日期] [类别] [店铺]"""
         args = self._extract_args(event, ("查账", "查看", "查询", "账单", "stats"))
-        rng, cat = self._parse_query(args)
+        rng, cat, shop = self._parse_query(args)
         if rng is None:
             yield event.plain_result(
-                "❌ 无法解析查询条件。用法：/记账 查账 [今天|昨天|本月|上月|YYYY-MM-DD|YYYY-MM-DD YYYY-MM-DD] [类别名]"
+                "❌ 无法解析查询条件。用法：/记账 查账 [今天|昨天|本月|上月|YYYY-MM-DD|YYYY-MM-DD YYYY-MM-DD] [类别名] [店铺名]"
             )
             return
         start, end = rng
         user_id = event.get_sender_id()
         try:
-            rows = await asyncio.to_thread(self._query_records, user_id, start, end, cat)
+            rows = await asyncio.to_thread(self._query_records, user_id, start, end, cat, shop)
         except Exception as e:
             logger.error(f"查账失败: {e}")
             yield event.plain_result(f"❌ 查询失败：{e}")
             return
-        yield event.plain_result(self._format_query_result(start, end, rows, cat))
+        yield event.plain_result(self._format_query_result(start, end, rows, cat, shop))
 
-    def _parse_query(self, args: str) -> tuple[Optional[tuple[str, str]], Optional[str]]:
-        """解析查账参数，返回 ((start, end) | None, category | None)。"""
+    def _parse_query(
+        self, args: str
+    ) -> tuple[Optional[tuple[str, str]], Optional[str], Optional[str]]:
+        """解析查账参数，返回 ((start, end) | None, category | None, shop | None)。"""
         args = args.strip()
         today = date.today()
         if not args:
-            return (today.isoformat(), today.isoformat()), None
+            return (today.isoformat(), today.isoformat()), None, None
         tokens = re.split(r"[\s　]+", args)
         cat: Optional[str] = None
-        # 仅当最后一个 token 命中预设类别时才视为类别过滤
+        shop: Optional[str] = None
+        # 遍历提取类别/店铺 token，剩下的都是日期相关
         cats = self._get_categories()
-        if len(tokens) >= 2 and tokens[-1] in cats:
-            cat = tokens[-1]
-            tokens = tokens[:-1]
+        shops = self._get_shops()
+        remaining: list[str] = []
+        for tok in tokens:
+            if cat is None and tok in cats:
+                cat = tok
+            elif shop is None and tok in shops:
+                shop = tok
+            else:
+                remaining.append(tok)
+        tokens = remaining
         if not tokens:
-            return (today.isoformat(), today.isoformat()), cat
+            return (today.isoformat(), today.isoformat()), cat, shop
         tok = tokens[0]
         if tok in ("今天", "今日", "today"):
-            return (today.isoformat(), today.isoformat()), cat
+            return (today.isoformat(), today.isoformat()), cat, shop
         if tok in ("昨天", "yesterday"):
             d = today - timedelta(days=1)
-            return (d.isoformat(), d.isoformat()), cat
+            return (d.isoformat(), d.isoformat()), cat, shop
         if tok in ("本月", "this_month"):
-            return (today.replace(day=1).isoformat(), today.isoformat()), cat
+            return (today.replace(day=1).isoformat(), today.isoformat()), cat, shop
         if tok in ("上月", "last_month"):
             last_day = today.replace(day=1) - timedelta(days=1)
-            return (last_day.replace(day=1).isoformat(), last_day.isoformat()), cat
+            return (last_day.replace(day=1).isoformat(), last_day.isoformat()), cat, shop
         if len(tokens) >= 2:
             try:
                 d1 = datetime.strptime(tokens[0], "%Y-%m-%d").date()
                 d2 = datetime.strptime(tokens[1], "%Y-%m-%d").date()
                 if d1 > d2:
                     d1, d2 = d2, d1
-                return (d1.isoformat(), d2.isoformat()), cat
+                return (d1.isoformat(), d2.isoformat()), cat, shop
             except ValueError:
                 pass
         try:
             d = datetime.strptime(tok, "%Y-%m-%d").date()
-            return (d.isoformat(), d.isoformat()), cat
+            return (d.isoformat(), d.isoformat()), cat, shop
         except ValueError:
-            return None, None
+            return None, None, None
+
+    # ---------- 月度汇总 ----------
+    @ledger.command("汇总", alias={"月度汇总", "月报", "月汇总", "monthly", "月账单"})
+    async def monthly(self, event: AstrMessageEvent):
+        """月度汇总：/记账 汇总 [年份] [店铺]，月底查账用"""
+        args = self._extract_args(event, ("汇总", "月度汇总", "月报", "月汇总", "monthly", "月账单"))
+        year = date.today().year
+        m = re.search(r"(20\d{2})", args)
+        if m:
+            year = int(m.group(1))
+        shop: Optional[str] = None
+        for tok in re.split(r"[\s　]+", args.strip()):
+            if tok in self._get_shops():
+                shop = tok
+                break
+        user_id = event.get_sender_id()
+        try:
+            rows = await asyncio.to_thread(self._monthly_query, user_id, year, shop)
+        except Exception as e:
+            logger.error(f"月度汇总失败: {e}")
+            yield event.plain_result(f"❌ 查询失败：{e}")
+            return
+        currency = str(self.config.get("currency_symbol") or "元")
+        lines = ["📅 月度汇总" + (f"（{shop}）" if shop else "") + f"｜{year} 年"]
+        if not rows:
+            lines.append("暂无记录。")
+            yield event.plain_result("\n".join(lines))
+            return
+        total_all = 0.0
+        cnt_all = 0
+        for r in rows:
+            ym = r["ym"]
+            month = int(ym[5:7])
+            total_all += r["total"] or 0
+            cnt_all += r["cnt"]
+            lines.append(f"{month:02d}月  {r['total']:.2f} {currency}（{r['cnt']} 笔）")
+        lines.append("——————————————")
+        lines.append(f"全年合计：{total_all:.2f} {currency}（{cnt_all} 笔）")
+        lines.append("")
+        lines.append("提示：/记账 汇总 2025 熊大爷｜/记账 查账 本月 熊大爷")
+        yield event.plain_result("\n".join(lines))
 
     # ---------- 类别管理 ----------
     @ledger.command("类别", alias={"category", "分类"})
@@ -762,24 +880,26 @@ class FoodLedgerPlugin(Star):
     @ledger.command("帮助", alias={"help", "用法", "?"})
     async def help_cmd(self, event: AstrMessageEvent):
         """餐饮记账插件使用说明"""
+        shops = "、".join(self._get_shops()) or "（未配置，可在插件配置中设置）"
         yield event.plain_result(
             "📒 餐饮记账插件使用说明\n"
             "——————————————\n"
             "🧾 记账（AI 识别）：\n"
             "· 直接发账单截图/支付截图，自动识别记账\n"
             "· /记账 记 早餐包子豆浆 8.5 元\n"
-            "· /记账 记 昨晚聚餐 AA 每人 66\n"
-            "图片账单：先由「图片转述模型」转成文字，\n"
-            "再由「解析模型」整理成账目，结果先审查后入库。\n"
+            "图片账单：图片转述模型转成文字 → 解析模型\n"
+            "整理成账目 → 先审查确认后才入库。\n"
             "——————————————\n"
-            "✅ /记账 确认 —— 确认草稿并入账\n"
+            "✅ /记账 确认 [店铺名] —— 确认入账（多店需选店）\n"
+            "   🏪 当前店铺：{shops}\n"
             "✏️ /记账 修改 1 金额 15 —— 修改草稿条目\n"
             "🚫 /记账 取消 —— 放弃草稿\n"
-            "📊 /记账 查账 [今天|昨天|本月|上月|日期|日期 日期] [类别]\n"
+            "📊 /记账 查账 [今天|昨天|本月|上月|日期|日期 日期] [类别] [店铺]\n"
+            "📅 /记账 汇总 [年份] [店铺] —— 月度汇总，月底查账用\n"
             "🏷️ /记账 类别 [添加 xxx] —— 管理类别\n"
-            "🤖 模型设置请在 AstrBot WebUI 插件配置中进行\n"
-            "   （图片转述模型 / 账单解析模型）\n"
+            "❓ /记账 帮助 —— 本说明\n"
             "——————————————\n"
+            "模型设置在 AstrBot WebUI 插件配置中（图片转述/解析模型、店铺列表）\n"
             "数据保存在 AstrBot data/plugin_data 目录下，卸载插件不丢失。"
         )
 

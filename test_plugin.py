@@ -227,28 +227,36 @@ class TestQueryParsing(unittest.TestCase):
         )
 
     def test_default_today(self):
-        rng, cat = self.plugin._parse_query("")
+        rng, cat, shop = self.plugin._parse_query("")
         self.assertEqual(rng[0], rng[1])
+        self.assertIsNone(shop)
 
     def test_this_month(self):
-        rng, cat = self.plugin._parse_query("本月")
+        rng, cat, shop = self.plugin._parse_query("本月")
         self.assertTrue(rng[0].endswith("-01"))
 
     def test_date_range(self):
-        rng, cat = self.plugin._parse_query("2026-08-01 2026-08-31")
+        rng, cat, shop = self.plugin._parse_query("2026-08-01 2026-08-31")
         self.assertEqual(rng, ("2026-08-01", "2026-08-31"))
 
     def test_reversed_range(self):
-        rng, cat = self.plugin._parse_query("2026-08-31 2026-08-01")
+        rng, cat, shop = self.plugin._parse_query("2026-08-31 2026-08-01")
         self.assertEqual(rng, ("2026-08-01", "2026-08-31"))
 
     def test_date_with_category(self):
-        rng, cat = self.plugin._parse_query("2026-08-01 午餐")
+        rng, cat, shop = self.plugin._parse_query("2026-08-01 午餐")
         self.assertEqual(rng, ("2026-08-01", "2026-08-01"))
         self.assertEqual(cat, "午餐")
 
+    def test_date_with_shop(self):
+        self.plugin.config["shops"] = "熊大爷,曼玲粥"
+        rng, cat, shop = self.plugin._parse_query("本月 熊大爷 午餐")
+        self.assertEqual(shop, "熊大爷")
+        self.assertEqual(cat, "午餐")
+        self.assertTrue(rng[0].endswith("-01"))
+
     def test_garbage(self):
-        rng, cat = self.plugin._parse_query("不是日期")
+        rng, cat, shop = self.plugin._parse_query("不是日期")
         self.assertIsNone(rng)
 
 
@@ -565,10 +573,10 @@ class TestAutoLedger(unittest.TestCase):
         async def run():
             p = self._plugin()
             ts = 1750000000
-            p._insert_records([("u1", "s1", "早餐", 8.5, "包子", "2026-08-12", ts, "raw", "t", "")])
+            p._insert_records([("u1", "s1", "熊大爷", "早餐", 8.5, "包子", "2026-08-12", ts, "raw", "t", "")])
             rows = p._query_records("u1", "2026-08-01", "2026-08-31")
             fmt = p._format_query_result("2026-08-12", "2026-08-12", rows, None)
-            self.assertRegex(fmt, r"#1 \d{2}-\d{2} \d{2}:\d{2} 早餐 8.50")
+            self.assertRegex(fmt, r"#1 \d{2}-\d{2} \d{2}:\d{2} \[熊大爷\] 早餐 8.50")
             self.assertIn("总支出：8.50", fmt)
         asyncio.run(run())
 
@@ -584,6 +592,86 @@ class TestAutoLedger(unittest.TestCase):
         asyncio.run(run())
 
 
+class TestShopAndMonthly(unittest.TestCase):
+    """多店铺记账 + 月度汇总 + 老库迁移"""
+
+    def setUp(self):
+        plugin_mod.FoodLedgerPlugin._shared_kv.clear()
+        # 清空数据库，避免其他测试类的数据残留
+        conn = plugin_mod.FoodLedgerPlugin(Context(), AstrBotConfig({}))._get_conn()
+        conn.execute("DELETE FROM records")
+        conn.commit()
+        conn.close()
+
+    def _plugin(self):
+        return plugin_mod.FoodLedgerPlugin(Context(), AstrBotConfig({"shops": "熊大爷,曼玲粥"}))
+
+    def test_confirm_with_shop_and_query_filter(self):
+        """确认带店铺入库，查账可按店铺过滤"""
+
+        async def run():
+            p = self._plugin()
+            # 两个店各插一条
+            p._insert_records([
+                ("u1", "s1", "熊大爷", "早餐", 8.5, "包子", "2026-08-12", 1750000000, "", "", ""),
+                ("u1", "s1", "曼玲粥", "午餐", 15.0, "粥", "2026-08-12", 1750000000, "", "", ""),
+            ])
+            all_rows = p._query_records("u1", "2026-08-01", "2026-08-31")
+            self.assertEqual(len(all_rows), 2)
+            xiong = p._query_records("u1", "2026-08-01", "2026-08-31", shop="熊大爷")
+            self.assertEqual(len(xiong), 1)
+            self.assertEqual(xiong[0]["amount"], 8.5)
+            fmt = p._format_query_result("2026-08-12", "2026-08-12", all_rows, None)
+            self.assertIn("[熊大爷]", fmt)
+            self.assertIn("[曼玲粥]", fmt)
+            fmt_shop = p._format_query_result("2026-08-12", "2026-08-12", xiong, None, "熊大爷")
+            self.assertIn("（熊大爷）", fmt_shop)
+            self.assertNotIn("[曼玲粥]", fmt_shop)
+        asyncio.run(run())
+
+    def test_monthly_summary(self):
+        """月度汇总按年统计"""
+
+        async def run():
+            p = self._plugin()
+            p._insert_records([
+                ("u1", "s1", "熊大爷", "早餐", 100, "a", "2026-01-05", 1750000000, "", "", ""),
+                ("u1", "s1", "熊大爷", "午餐", 200, "b", "2026-01-20", 1750000000, "", "", ""),
+                ("u1", "s1", "曼玲粥", "晚餐", 50, "c", "2026-02-10", 1750000000, "", "", ""),
+                ("u1", "s1", "熊大爷", "早餐", 999, "d", "2025-12-31", 1750000000, "", "", ""),
+            ])
+            rows = p._monthly_query("u1", 2026)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["ym"], "2026-01")
+            self.assertEqual(rows[0]["cnt"], 2)
+            self.assertAlmostEqual(rows[0]["total"], 300.0)
+            rows_shop = p._monthly_query("u1", 2026, "曼玲粥")
+            self.assertEqual(len(rows_shop), 1)
+            self.assertEqual(rows_shop[0]["ym"], "2026-02")
+        asyncio.run(run())
+
+    def test_legacy_db_migration(self):
+        """老库（无 shop 列）加载时自动补列"""
+
+        def run():
+            p = self._plugin()
+            conn = p._get_conn()
+            # 模拟老库：删掉 shop 列
+            conn.execute("ALTER TABLE records DROP COLUMN shop")
+            conn.commit()
+            conn.close()
+            # 重新初始化（触发迁移逻辑）
+            p2 = self._plugin()
+            conn2 = p2._get_conn()
+            cols = [r[1] for r in conn2.execute("PRAGMA table_info(records)").fetchall()]
+            conn2.close()
+            self.assertIn("shop", cols)
+            # 迁移后老数据 shop 为空
+            rows = p2._query_records("u1", "2000-01-01", "2100-01-01")
+            self.assertEqual(len(rows), 0)
+        run()
+
+
 class TestDB(unittest.TestCase):
     def setUp(self):
         self.plugin = plugin_mod.FoodLedgerPlugin(Context(), AstrBotConfig({}))
@@ -595,7 +683,7 @@ class TestDB(unittest.TestCase):
         plugin_mod.FoodLedgerPlugin._shared_kv.clear()
 
     def test_insert_and_query(self):
-        rows = [("u1", "s1", "早餐", 8.5, "包子", "2026-08-12", 1750000000, "raw", "default", "vision-x")]
+        rows = [("u1", "s1", "熊大爷", "早餐", 8.5, "包子", "2026-08-12", 1750000000, "raw", "default", "vision-x")]
         n = self.plugin._insert_records(rows)
         self.assertEqual(n, 1)
         res = self.plugin._query_records("u1", "2026-08-01", "2026-08-31")
@@ -637,7 +725,7 @@ class TestDB(unittest.TestCase):
             self.assertIn("test:group:123", p2._drafts)
             # 确认入库
             rows = [
-                (ev_sender_id := "u1", "test:group:123", it["category"], it["amount"],
+                (ev_sender_id := "u1", "test:group:123", "", it["category"], it["amount"],
                  it["description"], "2026-08-12", 1750000000, "x", "default", "")
                 for it in p2._drafts["test:group:123"]["items"]
             ]
