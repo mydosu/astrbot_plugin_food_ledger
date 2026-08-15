@@ -53,15 +53,15 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个专业的餐饮记账助手。用户会�
 USER_PROMPT_TEMPLATE = """请识别以下餐饮账单并输出 JSON（只输出 JSON 对象本身，不要代码块标记，不要任何其他文字）：
 {content}"""
 
-# 图片转述模型用的提示词：把账单图片转成紧凑文字（省 token、方便后续解析）
-VISION_TRANSCRIBE_PROMPT = """请转述这张餐饮账单图片（小票/支付截图）里的全部文字内容。
+# 图片转述模型用的提示词：把账单图片转成文字（省 token、方便后续解析）
+VISION_TRANSCRIBE_PROMPT = """请转述这张餐饮账单图片（小票/支付截图）里的文字。
 要求：
-- 每行一条消费：项目名称 + 金额数字，如：牛肉面 25
-- 最后一行写：合计 <金额>
+- 把看到的文字尽量原样分行抄写出来，重点是每一笔的：项目名称 + 金额
+- 金额必须写清楚，如：牛肉面 25、合计 45.8
 - 商家名、日期如有也写出来
 - 只输出文字内容，不要任何分析或评论
 - 看不清的字用 ? 代替
-- 图片里没有文字时，只输出：无文字"""
+- 如果图片里看不到任何文字，只输出：无文字"""
 
 
 class FoodLedgerPlugin(Star):
@@ -244,6 +244,9 @@ class FoodLedgerPlugin(Star):
                 transcribed, err = await self._transcribe_images(vision_provider_id, images)
                 if err:
                     return {"error": err}
+                logger.info(f"[记账] 图片转述结果: {transcribed[:300]!r}")
+                if not transcribed or transcribed.strip() in ("无文字", "[无文字]"):
+                    return {"error": "图片转述模型没有识别到任何文字。请检查 llama.cpp 是否加载了视觉投影文件（--mmproj，否则模型看不到图片），或换一个视觉模型"}
             else:
                 logger.info("未配置图片转述模型，尝试用解析模型直接识别图片")
                 image_urls = await self._prepare_image_urls(images)
