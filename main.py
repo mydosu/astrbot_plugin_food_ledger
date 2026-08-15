@@ -273,6 +273,7 @@ class FoodLedgerPlugin(Star):
         image_urls = await self._prepare_image_urls(images)
         if image_urls is None:
             return None, "图片处理失败（下载或压缩出错）"
+        logger.info(f"[记账] 发送给转述模型的图片格式: {image_urls[0][:80]!r}（共 {len(image_urls)} 张）")
         try:
             resp = await self.context.llm_generate(
                 chat_provider_id=vision_provider_id,
